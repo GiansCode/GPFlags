@@ -18,11 +18,13 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.sql.SQLException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Level;
 
 /**
- * Manager for flags
+ * Manager for flags.
  * Inherited = Checks higher levels
  * Self = Doesn't check higher levels
  * Raw = Will return the flag for flags that are set to be unset
@@ -35,6 +37,11 @@ public class FlagManager {
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Flag>> flags;
     private final List<String> worlds = new ArrayList<>();
 
+    /** Flag used during bulk-load to suppress per-row DB writes. */
+    private boolean isLoading = false;
+    /** Set after {@link #setDatabaseManager(DatabaseManager)} is called. */
+    private DatabaseManager databaseManager = null;
+
     public static final String DEFAULT_FLAG_ID = "-2";
 
     public FlagManager() {
@@ -43,18 +50,65 @@ public class FlagManager {
         Bukkit.getWorlds().forEach(world -> worlds.add(world.getName()));
     }
 
+    // -------------------------------------------------------------------------
+    // Database integration
+    // -------------------------------------------------------------------------
+
     /**
-     * Register a new flag definition
+     * Attach (or replace) the {@link DatabaseManager}.
+     * Pass {@code null} to revert to YAML-only storage.
+     */
+    public void setDatabaseManager(@Nullable DatabaseManager db) {
+        this.databaseManager = db;
+    }
+
+    /**
+     * Asynchronously persist a single flag row to MySQL.
+     * No-op if no DB is configured or the plugin is currently loading.
+     */
+    private void asyncSaveFlag(String scopeId, String flagName, String params, boolean value) {
+        if (isLoading || databaseManager == null || !databaseManager.isConnected()) return;
+        Bukkit.getScheduler().runTaskAsynchronously(GPFlags.getInstance(), () -> {
+            try {
+                databaseManager.saveFlag(scopeId, flagName, params, value);
+            } catch (SQLException e) {
+                GPFlags.getInstance().getLogger().log(Level.WARNING,
+                        "Failed to save flag '" + flagName + "' for scope '" + scopeId + "' to MySQL.", e);
+            }
+        });
+    }
+
+    /**
+     * Asynchronously delete a single flag row from MySQL.
+     * No-op if no DB is configured or the plugin is currently loading.
+     */
+    private void asyncDeleteFlag(String scopeId, String flagName) {
+        if (isLoading || databaseManager == null || !databaseManager.isConnected()) return;
+        Bukkit.getScheduler().runTaskAsynchronously(GPFlags.getInstance(), () -> {
+            try {
+                databaseManager.deleteFlag(scopeId, flagName);
+            } catch (SQLException e) {
+                GPFlags.getInstance().getLogger().log(Level.WARNING,
+                        "Failed to delete flag '" + flagName + "' for scope '" + scopeId + "' from MySQL.", e);
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Flag definition registry
+    // -------------------------------------------------------------------------
+
+    /**
+     * Register a new flag definition.
      *
      * @param def Flag Definition to register
      */
     public void registerFlagDefinition(FlagDefinition def) {
-        String name = def.getName();
-        this.definitions.put(name.toLowerCase(), def);
+        this.definitions.put(def.getName().toLowerCase(), def);
     }
 
     /**
-     * Get a flag definition by name
+     * Get a flag definition by name.
      *
      * @param name Name of the flag to get
      * @return Flag definition by name
@@ -64,7 +118,7 @@ public class FlagManager {
     }
 
     /**
-     * Get a collection of all registered flag definitions
+     * Get a collection of all registered flag definitions.
      *
      * @return All registered flag definitions
      */
@@ -73,7 +127,7 @@ public class FlagManager {
     }
 
     /**
-     * Get a collection of names of all registered flag definitions
+     * Get a collection of names of all registered flag definitions.
      *
      * @return Names of all registered flag definitions
      */
@@ -81,14 +135,20 @@ public class FlagManager {
         return new ArrayList<>(this.definitions.keySet());
     }
 
+    // -------------------------------------------------------------------------
+    // Flag mutation
+    // -------------------------------------------------------------------------
+
     /**
-     * Set a flag for a claim. This is called on startup to load the datastore and when setting a flag to a value including false
+     * Set a flag for a claim.  Called on startup to populate the datastore and
+     * whenever a flag is set (including to {@code false}).
      *
-     * @param claimId  ID of {@link Claim} which this flag will be attached to
-     * @param def      Flag definition to set
-     * @param isActive Whether the flag will be active or not
-     * @param args     Message parameters
-     * @return Result of setting flag
+     * @param claimId  ID of the {@link Claim} this flag belongs to
+     * @param def      Flag definition
+     * @param isActive Whether the flag will be active
+     * @param sender   Command sender (may be null during load)
+     * @param args     Flag parameters
+     * @return Result of the operation
      */
     public SetFlagResult setFlag(String claimId, FlagDefinition def, boolean isActive, CommandSender sender, String... args) {
         StringBuilder internalParameters = new StringBuilder();
@@ -107,7 +167,6 @@ public class FlagManager {
                         offlinePlayer = Bukkit.getOfflinePlayer(arg);
                         arg = offlinePlayer.getUniqueId().toString();
                     }
-
                 }
             }
             internalParameters.append(arg).append(" ");
@@ -137,7 +196,10 @@ public class FlagManager {
         }
         claimFlags.put(key, flag);
 
-        // Deal with default flags being set
+        // Persist to MySQL (write-through, async)
+        asyncSaveFlag(claimId, key, flag.parameters, isActive);
+
+        // Notify definitions for default flags
         if (DEFAULT_FLAG_ID.equals(claimId)) {
             for (Claim claim : GriefPrevention.instance.dataStore.getClaims()) {
                 if (isActive) {
@@ -166,14 +228,12 @@ public class FlagManager {
     }
 
     /**
-     *
      * @param claim claim or subclaim
-     * @param flag flag name in all lowercase
+     * @param flag  flag name in all lowercase
      * @return The raw instance of the flag
      */
     public @Nullable Flag getRawClaimFlag(@NotNull Claim claim, @NotNull String flag) {
-        String claimId = claim.getID().toString();
-        ConcurrentHashMap<String, Flag> claimFlags = this.flags.get(claimId);
+        ConcurrentHashMap<String, Flag> claimFlags = this.flags.get(claim.getID().toString());
         if (claimFlags == null) return null;
         return claimFlags.get(flag);
     }
@@ -197,9 +257,9 @@ public class FlagManager {
     }
 
     /**
-     * @param location
-     * @param flagname
-     * @param claim
+     * @param location location to look up
+     * @param flagname flag name
+     * @param claim    optional pre-resolved claim
      * @return the effective flag at the location
      */
     public @Nullable Flag getEffectiveFlag(@Nullable Location location, @NotNull String flagname, @Nullable Claim claim) {
@@ -239,11 +299,10 @@ public class FlagManager {
     }
 
     /**
-     *
-     * @param flagname
-     * @param claim
-     * @param world World to be checked if claim is null
-     * @return
+     * @param flagname flag name
+     * @param claim    optional pre-resolved claim
+     * @param world    world to check if claim is null
+     * @return the effective flag for the given context
      */
     public @Nullable Flag getEffectiveFlag(@NotNull String flagname, @Nullable Claim claim, @NotNull World world) {
         flagname = flagname.toLowerCase();
@@ -279,7 +338,7 @@ public class FlagManager {
     }
 
     /**
-     * Get all flags in a claim
+     * Get all flags in a claim.
      *
      * @param claim Claim to get flags from
      * @return All flags in this claim
@@ -290,7 +349,7 @@ public class FlagManager {
     }
 
     /**
-     * Get all flags in a claim
+     * Get all flags in a claim.
      *
      * @param claimID ID of claim
      * @return All flags in this claim
@@ -306,7 +365,7 @@ public class FlagManager {
     }
 
     /**
-     * Unset a flag in a claim
+     * Unset a flag in a claim.
      *
      * @param claim Claim to remove flag from
      * @param def   Flag definition to remove
@@ -317,7 +376,7 @@ public class FlagManager {
     }
 
     /**
-     * Unset a flag in a claim
+     * Unset a flag in a claim.
      *
      * @param claimId ID of claim
      * @param def     Flag definition to remove
@@ -332,13 +391,25 @@ public class FlagManager {
                 Claim claim = GriefPrevention.instance.dataStore.getClaim(Long.parseLong(claimId));
                 def.onFlagUnset(claim);
             } catch (Throwable ignored) {}
-            claimFlags.remove(def.getName().toLowerCase());
+            String flagKey = def.getName().toLowerCase();
+            claimFlags.remove(flagKey);
+            asyncDeleteFlag(claimId, flagKey);
             return new SetFlagResult(true, def.getUnSetMessage());
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Persistence – load
+    // -------------------------------------------------------------------------
+
+    /**
+     * Load flags from a YAML-formatted string.
+     * If a {@link DatabaseManager} is connected this method is still available
+     * for migration purposes but normal startup uses {@link #loadFromDatabase()}.
+     */
     List<MessageSpecifier> load(String input) throws InvalidConfigurationException {
         this.flags.clear();
+        isLoading = true;
         YamlConfiguration yaml = new YamlConfiguration();
         yaml.loadFromString(input);
 
@@ -362,23 +433,99 @@ public class FlagManager {
                 }
             }
         }
+        isLoading = false;
         if (errors.isEmpty() && FlagsDataStore.PRIOR_CONFIG_VERSION == 0) save();
         return errors;
     }
 
-    public void save() {
+    /**
+     * Load all flags from MySQL.  Should only be called after flag definitions
+     * have been registered.
+     *
+     * @return A list of validation errors (empty on full success)
+     */
+    public List<MessageSpecifier> loadFromDatabase() {
+        this.flags.clear();
+        isLoading = true;
+        ArrayList<MessageSpecifier> errors = new ArrayList<>();
         try {
-            this.save(FlagsDataStore.flagsFilePath);
-        } catch (Throwable e) {
-            e.printStackTrace();
+            Map<String, Map<String, DatabaseManager.FlagEntry>> allFlags =
+                    databaseManager.loadAllFlags();
+            for (Map.Entry<String, Map<String, DatabaseManager.FlagEntry>> scopeEntry : allFlags.entrySet()) {
+                String claimID = scopeEntry.getKey();
+                for (Map.Entry<String, DatabaseManager.FlagEntry> flagEntry : scopeEntry.getValue().entrySet()) {
+                    String flagName = flagEntry.getKey();
+                    DatabaseManager.FlagEntry fe = flagEntry.getValue();
+                    FlagDefinition def = getFlagDefinitionByName(flagName);
+                    if (def != null) {
+                        String params = fe.params() != null ? fe.params() : "";
+                        SetFlagResult result = setFlag(claimID, def, fe.value(), null, params);
+                        if (!result.success) {
+                            errors.add(result.message);
+                        }
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            GPFlags.getInstance().getLogger().log(Level.SEVERE,
+                    "Failed to load flags from MySQL.", e);
+        } finally {
+            isLoading = false;
         }
+        return errors;
+    }
+
+    // -------------------------------------------------------------------------
+    // Persistence – save
+    // -------------------------------------------------------------------------
+
+    /**
+     * Persist all in-memory flags.
+     * Uses MySQL when a connected {@link DatabaseManager} is available,
+     * otherwise falls back to YAML.
+     */
+    public void save() {
+        if (databaseManager != null && databaseManager.isConnected()) {
+            saveToDatabase();
+        } else {
+            try {
+                this.save(FlagsDataStore.flagsFilePath);
+            } catch (Throwable e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    /** Async bulk-save of the entire in-memory flag store to MySQL. */
+    private void saveToDatabase() {
+        Map<String, Map<String, DatabaseManager.FlagEntry>> snapshot = buildDatabaseSnapshot();
+        Bukkit.getScheduler().runTaskAsynchronously(GPFlags.getInstance(), () -> {
+            try {
+                databaseManager.saveAllFlags(snapshot);
+            } catch (SQLException e) {
+                GPFlags.getInstance().getLogger().log(Level.WARNING,
+                        "Failed to bulk-save flags to MySQL.", e);
+            }
+        });
+    }
+
+    /** Build a serialisable snapshot of the current in-memory flag state. */
+    private Map<String, Map<String, DatabaseManager.FlagEntry>> buildDatabaseSnapshot() {
+        Map<String, Map<String, DatabaseManager.FlagEntry>> snapshot = new HashMap<>();
+        for (Map.Entry<String, ConcurrentHashMap<String, Flag>> scopeEntry : this.flags.entrySet()) {
+            Map<String, DatabaseManager.FlagEntry> flagMap = new HashMap<>();
+            for (Map.Entry<String, Flag> flagEntry : scopeEntry.getValue().entrySet()) {
+                Flag f = flagEntry.getValue();
+                flagMap.put(flagEntry.getKey(), new DatabaseManager.FlagEntry(f.parameters, f.getSet()));
+            }
+            snapshot.put(scopeEntry.getKey(), flagMap);
+        }
+        return snapshot;
     }
 
     public HashSet<String> getUsedFlags() {
         HashSet<String> usedFlags = new HashSet<>();
-        Set<String> claimIDs = this.flags.keySet();
-        for (String claimID : claimIDs) {
-            ConcurrentHashMap<String, Flag> claimFlags = this.flags.get(claimID);
+        for (ConcurrentHashMap<String, Flag> claimFlags : this.flags.values()) {
             usedFlags.addAll(claimFlags.keySet());
         }
         return usedFlags;
@@ -386,20 +533,14 @@ public class FlagManager {
 
     public String flagsToString() {
         YamlConfiguration yaml = new YamlConfiguration();
-
-        Set<String> claimIDs = this.flags.keySet();
-        for (String claimID : claimIDs) {
-            ConcurrentHashMap<String, Flag> claimFlags = this.flags.get(claimID);
-            Set<String> flagNames = claimFlags.keySet();
-            for (String flagName : flagNames) {
-                Flag flag = claimFlags.get(flagName);
-                String paramsPath = claimID + "." + flagName + ".params";
-                yaml.set(paramsPath, flag.parameters);
-                String valuePath = claimID + "." + flagName + ".value";
-                yaml.set(valuePath, flag.getSet());
+        for (Map.Entry<String, ConcurrentHashMap<String, Flag>> scopeEntry : this.flags.entrySet()) {
+            String claimID = scopeEntry.getKey();
+            for (Map.Entry<String, Flag> flagEntry : scopeEntry.getValue().entrySet()) {
+                Flag flag = flagEntry.getValue();
+                yaml.set(claimID + "." + flagEntry.getKey() + ".params", flag.parameters);
+                yaml.set(claimID + "." + flagEntry.getKey() + ".value", flag.getSet());
             }
         }
-
         return yaml.saveToString();
     }
 
@@ -412,11 +553,10 @@ public class FlagManager {
     }
 
     /**
+     * Load flags from a file (YAML format).
      *
-     * @param file
+     * @param file Source file
      * @return A list of errors
-     * @throws IOException
-     * @throws InvalidConfigurationException
      */
     public List<MessageSpecifier> load(File file) throws IOException, InvalidConfigurationException {
         if (!file.exists()) return this.load("");
@@ -434,24 +574,40 @@ public class FlagManager {
         this.flags.clear();
     }
 
+    /**
+     * Remove flags whose scope IDs are no longer valid claim IDs,
+     * then persist the cleanup both in-memory and in the backing store.
+     */
     void removeExceptClaimIDs(HashSet<String> validClaimIDs) {
         HashSet<String> toRemove = new HashSet<>();
         for (String key : this.flags.keySet()) {
-            //if not a valid claim ID (maybe that claim was deleted)
             if (!validClaimIDs.contains(key)) {
                 try {
                     int numericalValue = Integer.parseInt(key);
-
-                    //if not a special value like default claims ID, remove
+                    // Negative special values (like DEFAULT_FLAG_ID = "-2") are kept
                     if (numericalValue >= 0) toRemove.add(key);
                 } catch (NumberFormatException ignore) {
-                } //non-numbers represent server or world flags, so ignore those
+                    // Non-numeric keys are world/server scopes – keep them
+                }
             }
         }
         for (String key : toRemove) {
             this.flags.remove(key);
         }
+
+        // Purge stale rows from MySQL asynchronously
+        if (databaseManager != null && databaseManager.isConnected() && !toRemove.isEmpty()) {
+            final HashSet<String> finalToRemove = new HashSet<>(toRemove);
+            Bukkit.getScheduler().runTaskAsynchronously(GPFlags.getInstance(), () -> {
+                try {
+                    databaseManager.deleteFlagsForScopes(finalToRemove);
+                } catch (SQLException e) {
+                    GPFlags.getInstance().getLogger().log(Level.WARNING,
+                            "Failed to purge stale claim flags from MySQL.", e);
+                }
+            });
+        }
+
         save();
     }
-
 }

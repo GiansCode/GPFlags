@@ -23,7 +23,7 @@ import java.util.HashSet;
 import java.util.List;
 
 public class GPFlagsConfig {
-    
+
     private final GPFlags plugin;
     private final FlagManager flagManager;
 
@@ -38,13 +38,37 @@ public class GPFlagsConfig {
     public void loadConfig() {
         this.flagManager.clear();
 
-        //load the config if it exists
-        FileConfiguration inConfig = YamlConfiguration.loadConfiguration(new File(FlagsDataStore.configFilePath));
+        FileConfiguration inConfig  = YamlConfiguration.loadConfiguration(new File(FlagsDataStore.configFilePath));
         FileConfiguration outConfig = new YamlConfiguration();
 
+        // ------------------------------------------------------------------
+        // General settings
+        // ------------------------------------------------------------------
         LOG_ENTER_EXIT_COMMANDS = inConfig.getBoolean("Settings.Log Enter/Exit Messages To Console", true);
         outConfig.set("Settings.Log Enter/Exit Messages To Console", LOG_ENTER_EXIT_COMMANDS);
 
+        // ------------------------------------------------------------------
+        // Database settings
+        // ------------------------------------------------------------------
+        String dbType       = inConfig.getString("Database.Type", "yaml").toLowerCase();
+        String dbHost       = inConfig.getString("Database.MySQL.Host", "localhost");
+        int    dbPort       = inConfig.getInt("Database.MySQL.Port", 3306);
+        String dbDatabase   = inConfig.getString("Database.MySQL.Database", "minecraft");
+        String dbUsername   = inConfig.getString("Database.MySQL.Username", "root");
+        String dbPassword   = inConfig.getString("Database.MySQL.Password", "");
+        String tablePrefix  = inConfig.getString("Database.MySQL.Table-Prefix", "gpflags_");
+
+        outConfig.set("Database.Type", dbType);
+        outConfig.set("Database.MySQL.Host", dbHost);
+        outConfig.set("Database.MySQL.Port", dbPort);
+        outConfig.set("Database.MySQL.Database", dbDatabase);
+        outConfig.set("Database.MySQL.Username", dbUsername);
+        outConfig.set("Database.MySQL.Password", dbPassword);
+        outConfig.set("Database.MySQL.Table-Prefix", tablePrefix);
+
+        // ------------------------------------------------------------------
+        // Per-world settings
+        // ------------------------------------------------------------------
         List<World> worlds = plugin.getServer().getWorlds();
         ArrayList<String> worldSettingsKeys = new ArrayList<>();
         for (World world : worlds) {
@@ -102,12 +126,34 @@ public class GPFlagsConfig {
             MessagingUtil.sendMessage(null, "Unable to write to the configuration file at \"" + FlagsDataStore.configFilePath + "\"");
         }
 
-        //register flag definitions
+        // ------------------------------------------------------------------
+        // Initialise database (close old one first on reload)
+        // ------------------------------------------------------------------
+        DatabaseManager oldDb = plugin.getDatabaseManager();
+        if (oldDb != null) {
+            oldDb.close();
+        }
+
+        DatabaseManager newDb = null;
+        if ("mysql".equals(dbType)) {
+            newDb = new DatabaseManager(plugin, dbHost, dbPort, dbDatabase, dbUsername, dbPassword, tablePrefix);
+            if (!newDb.isConnected()) {
+                MessagingUtil.sendMessage(null,
+                        "<red>MySQL connection failed – falling back to YAML storage. Check your config.yml.");
+                newDb = null;
+            }
+        }
+        plugin.setDatabaseManager(newDb);
+        flagManager.setDatabaseManager(newDb);
+
+        // ------------------------------------------------------------------
+        // Register flag definitions (first run only)
+        // ------------------------------------------------------------------
         if (!plugin.registeredFlagDefinitions) {
             plugin.registeredFlagDefinitions = true;
             this.flagManager.registerFlagDefinition(new FlagDef_NoMonsterSpawns(this.flagManager, plugin));
             this.flagManager.registerFlagDefinition(new FlagDef_NoMonsters(this.flagManager, plugin));
-            
+
             FlagDef_AllowPvP allowPvPDef = new FlagDef_AllowPvP(this.flagManager, plugin);
             allowPvPDef.firstTimeSetup();
             this.flagManager.registerFlagDefinition(allowPvPDef);
@@ -148,7 +194,7 @@ public class GPFlagsConfig {
             FlagDef_NoFlight noFlight = new FlagDef_NoFlight(this.flagManager, plugin);
             noFlight.firstTimeSetup();
             this.flagManager.registerFlagDefinition(noFlight);
-            
+
             this.flagManager.registerFlagDefinition(new FlagDef_TrappedDestination(this.flagManager, plugin));
             this.flagManager.registerFlagDefinition(new FlagDef_NoLootProtection(this.flagManager, plugin));
             this.flagManager.registerFlagDefinition(new FlagDef_NoEnderPearl(this.flagManager, plugin));
@@ -207,36 +253,27 @@ public class GPFlagsConfig {
             try {
                 Class.forName("org.bukkit.event.raid.RaidTriggerEvent");
                 this.flagManager.registerFlagDefinition(new FlagDef_RaidMemberOnly(this.flagManager, plugin));
-            } catch (ClassNotFoundException ignored) {
-            }
+            } catch (ClassNotFoundException ignored) {}
 
             try {
                 Class.forName("com.destroystokyo.paper.event.block.AnvilDamagedEvent");
                 this.flagManager.registerFlagDefinition(new FlagDef_NoAnvilDamage(this.flagManager, plugin));
-            }
-            // if failed, we just won't have this flag available
-            catch (ClassNotFoundException ignore) {}
+            } catch (ClassNotFoundException ignore) {}
 
-            //try to hook into mcMMO
             try {
                 if (Bukkit.getPluginManager().getPlugin("mcMMO") != null) {
                     this.flagManager.registerFlagDefinition(new FlagDef_NoMcMMOSkills(this.flagManager, plugin));
                     this.flagManager.registerFlagDefinition(new FlagDef_NoMcMMODeathPenalty(this.flagManager, plugin));
-                    // Experimental
                     this.flagManager.registerFlagDefinition(new FlagDef_NoMcMMOXP(this.flagManager, plugin));
                 }
-            }
-            //if failed, we just won't have those flags available
-            catch (NoClassDefFoundError ignore) {}
+            } catch (NoClassDefFoundError ignore) {}
 
-            // EliteMob flags
             try {
                 if (Bukkit.getPluginManager().getPlugin("EliteMobs") != null) {
                     this.flagManager.registerFlagDefinition(new FlagDef_NoEliteMobSpawns(this.flagManager, plugin));
                 }
             } catch (NoClassDefFoundError ignored) {}
 
-            // vault-reliant flags
             try {
                 if (Bukkit.getPluginManager().getPlugin("Vault") != null) {
                     plugin.getCommand("buybuildtrust").setExecutor(new CommandBuyBuildTrust());
@@ -251,28 +288,43 @@ public class GPFlagsConfig {
                 }
             } catch (NoClassDefFoundError ignored) {}
         } else {
-            // Update world settings for flags (probably on a reload)
-            this.flagManager.getFlagDefinitions().forEach(flagDefinition -> flagDefinition.updateSettings(plugin.getWorldSettingsManager()));
+            this.flagManager.getFlagDefinitions().forEach(def -> def.updateSettings(plugin.getWorldSettingsManager()));
         }
 
+        // ------------------------------------------------------------------
+        // Load flags (MySQL or YAML)
+        // ------------------------------------------------------------------
         try {
-            File flagsFile = new File(FlagsDataStore.flagsFilePath);
-            List<MessageSpecifier> errors = this.flagManager.load(flagsFile);
-            if (errors.size() > 0) {
-                File errorFile = new File(FlagsDataStore.flagsErrorFilePath);
-                Files.copy(flagsFile, errorFile);
-                for (MessageSpecifier error : errors) {
-                    MessagingUtil.sendMessage(null, "Load Error: " + plugin.getFlagsDataStore().getMessage(error.messageID, error.messageParams));
+            List<MessageSpecifier> errors;
+
+            if (newDb != null && newDb.isConnected()) {
+                errors = this.flagManager.loadFromDatabase();
+            } else {
+                File flagsFile = new File(FlagsDataStore.flagsFilePath);
+                errors = this.flagManager.load(flagsFile);
+                if (!errors.isEmpty()) {
+                    File errorFile = new File(FlagsDataStore.flagsErrorFilePath);
+                    Files.copy(flagsFile, errorFile);
                 }
-                MessagingUtil.sendMessage(null, "<red>Problems encountered reading the flags data file! " +
-                        "Please share this log and your 'flagsError.yml' and 'flags.yml' files with the developer.");
+            }
+
+            for (MessageSpecifier error : errors) {
+                MessagingUtil.sendMessage(null,
+                        "Load Error: " + plugin.getFlagsDataStore().getMessage(error.messageID, error.messageParams));
+            }
+            if (!errors.isEmpty()) {
+                MessagingUtil.sendMessage(null,
+                        "<red>Problems encountered reading the flags data! "
+                        + "Please share this log with the developer.");
             }
         } catch (Throwable e) {
-            MessagingUtil.sendMessage(null, "<red>Unable to initialize the file system data store.  Details:");
+            MessagingUtil.sendMessage(null, "<red>Unable to load flags data. Details:");
             MessagingUtil.sendMessage(null, e.getMessage());
         }
 
-        //drop any flags which no longer correspond to existing land claims (maybe they were deleted)
+        // ------------------------------------------------------------------
+        // Prune flags for deleted claims
+        // ------------------------------------------------------------------
         Collection<Claim> topLevelClaims = GriefPrevention.instance.dataStore.getClaims();
         HashSet<String> validIDs = new HashSet<>();
         for (Claim claim : topLevelClaims) {

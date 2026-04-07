@@ -17,11 +17,12 @@ import org.bstats.bukkit.Metrics;
 import org.bukkit.entity.HumanEntity;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.jetbrains.annotations.Nullable;
 
 import me.ryanhamshire.GPFlags.flags.FlagDef_ViewContainers;
 
 /**
- * <b>Main GriefPrevention Flags class</b>
+ * Main GriefPrevention Flags plugin class.
  */
 public class GPFlags extends JavaPlugin {
 
@@ -29,9 +30,11 @@ public class GPFlags extends JavaPlugin {
     private FlagsDataStore flagsDataStore;
     private final FlagManager flagManager = new FlagManager();
     private WorldSettingsManager worldSettingsManager;
+    private DatabaseManager databaseManager;
     boolean registeredFlagDefinitions = false;
     private PlayerListener playerListener;
 
+    @Override
     public void onEnable() {
         long start = System.currentTimeMillis();
         instance = this;
@@ -56,7 +59,6 @@ public class GPFlags extends JavaPlugin {
         this.flagsDataStore = new FlagsDataStore();
         reloadConfig();
 
-        // Register Commands
         getCommand("allflags").setExecutor(new CommandAllFlags());
         getCommand("gpflags").setExecutor(new CommandGPFlags());
         getCommand("listclaimflags").setExecutor(new CommandListClaimFlags());
@@ -89,60 +91,81 @@ public class GPFlags extends JavaPlugin {
         MessagingUtil.sendMessage(null, "Successfully loaded in " + String.format("%.2f", finish) + " seconds");
     }
 
+    @Override
     public void onDisable() {
         FlagDef_ViewContainers.getViewingInventories().forEach(inv -> {
             inv.setContents(new ItemStack[inv.getSize()]);
             new ArrayList<>(inv.getViewers()).forEach(HumanEntity::closeInventory);
         });
+        if (databaseManager != null) {
+            databaseManager.close();
+            databaseManager = null;
+        }
         flagsDataStore = null;
         instance = null;
         playerListener = null;
     }
 
-
     /**
-     * Reload the config file
+     * Reload all config, messages, and flags from disk / database.
      */
+    @Override
     public void reloadConfig() {
         this.worldSettingsManager = new WorldSettingsManager();
         new GPFlagsConfig(this);
     }
 
+    // -------------------------------------------------------------------------
+    // Getters / setters
+    // -------------------------------------------------------------------------
+
     /**
-     * Get an instance of this plugin
-     *
-     * @return Instance of this plugin
+     * Get the singleton plugin instance.
      */
     public static GPFlags getInstance() {
         return instance;
     }
 
     /**
-     * Get an instance of the flags data store
-     *
-     * @return Instance of the flags data store
+     * Get the flags data store (messages).
      */
     public FlagsDataStore getFlagsDataStore() {
         return this.flagsDataStore;
     }
 
     /**
-     * Get an instance of the flag manager
-     *
-     * @return Instance of the flag manager
+     * Get the flag manager.
      */
     public FlagManager getFlagManager() {
         return this.flagManager;
     }
 
     /**
-     * Get an instance of the world settings manager
-     *
-     * @return Instance of the world settings manager
+     * Get the world settings manager.
      */
     public WorldSettingsManager getWorldSettingsManager() {
         return this.worldSettingsManager;
     }
+
+    /**
+     * Get the active {@link DatabaseManager}, or {@code null} if MySQL is not in use.
+     */
+    @Nullable
+    public DatabaseManager getDatabaseManager() {
+        return this.databaseManager;
+    }
+
+    /**
+     * Set (or replace) the active {@link DatabaseManager}.
+     * Called by {@link GPFlagsConfig} during (re)load.
+     */
+    public void setDatabaseManager(@Nullable DatabaseManager db) {
+        this.databaseManager = db;
+    }
+
+    // -------------------------------------------------------------------------
+    // Metrics
+    // -------------------------------------------------------------------------
 
     private void addCustomMetrics() {
         Metrics bStats = new Metrics(this, 17786);
@@ -150,29 +173,26 @@ public class GPFlags extends JavaPlugin {
         Set<String> usedFlags = GPFlags.getInstance().getFlagManager().getUsedFlags();
         Collection<FlagDefinition> defs = GPFlags.getInstance().getFlagManager().getFlagDefinitions();
         for (FlagDefinition def : defs) {
-            bStats.addCustomChart(new SimplePie("using_" + def.getName().toLowerCase(), () -> {
-                return String.valueOf(usedFlags.contains(def.getName().toLowerCase()));
-            }));
+            bStats.addCustomChart(new SimplePie("using_" + def.getName().toLowerCase(),
+                    () -> String.valueOf(usedFlags.contains(def.getName().toLowerCase()))));
         }
-        bStats.addCustomChart(new SimplePie("griefprevention_version", () -> {
-            return GriefPrevention.instance.getDescription().getVersion();
-        }));
+        bStats.addCustomChart(new SimplePie("griefprevention_version",
+                () -> GriefPrevention.instance.getDescription().getVersion()));
+
+        bStats.addCustomChart(new SimplePie("storage_backend",
+                () -> databaseManager != null && databaseManager.isConnected() ? "mysql" : "yaml"));
 
         String serverVersion = getServer().getBukkitVersion().split("-")[0];
-
-        bStats.addCustomChart(createStaticDrilldownStat("version_mc_plugin", serverVersion, getDescription().getVersion()));
-        bStats.addCustomChart(createStaticDrilldownStat("version_plugin_mc", getDescription().getVersion(), serverVersion));
-
+        bStats.addCustomChart(createStaticDrilldownStat("version_mc_plugin",  serverVersion, getDescription().getVersion()));
+        bStats.addCustomChart(createStaticDrilldownStat("version_plugin_mc",  getDescription().getVersion(), serverVersion));
         bStats.addCustomChart(createStaticDrilldownStat("version_brand_plugin", getServer().getName(), getDescription().getVersion()));
         bStats.addCustomChart(createStaticDrilldownStat("version_plugin_brand", getDescription().getVersion(), getServer().getName()));
-
-        bStats.addCustomChart(createStaticDrilldownStat("version_mc_brand", serverVersion, getServer().getName()));
-        bStats.addCustomChart(createStaticDrilldownStat("version_brand_mc", getServer().getName(), serverVersion));
+        bStats.addCustomChart(createStaticDrilldownStat("version_mc_brand",   serverVersion, getServer().getName()));
+        bStats.addCustomChart(createStaticDrilldownStat("version_brand_mc",   getServer().getName(), serverVersion));
     }
 
     private static DrilldownPie createStaticDrilldownStat(String statId, String value1, String value2) {
         final Map<String, Map<String, Integer>> map = ImmutableMap.of(value1, ImmutableMap.of(value2, 1));
         return new DrilldownPie(statId, () -> map);
     }
-
 }

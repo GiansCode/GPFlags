@@ -9,8 +9,8 @@ version: '${project.version}'
 api-version: '1.16'
 commands:
   gpflags:
-    description: Reload or get help
-    usage: /GPFlags <reload|help>
+    description: Reload, get help, or migrate data
+    usage: /GPFlags <reload|importyaml|help>
     permission: gpflags.command.gpflags
   allflags:
     description: Sends a list of all flags and their flag type
@@ -114,6 +114,7 @@ permissions:
           gpflags.command.unsetserverflag: true
           gpflags.command.listflags: true
           gpflags.command.reload: true
+          gpflags.command.importyaml: true
           gpflags.command.allflags: true
           gpflags.bypass.*: true
   gpflags.setflag:
@@ -498,6 +499,11 @@ permissions:
       gpflags.command.listclaimflags.use: true
   gpflags.command.reload:
     description: Grants permission to use /GPFlags reload.
+    default: op
+    children:
+      gpflags.command.gpflags: true
+  gpflags.command.importyaml:
+    description: Grants permission to use /GPFlags importyaml to migrate flags.yml data into MySQL.
     default: op
     children:
       gpflags.command.gpflags: true
